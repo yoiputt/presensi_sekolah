@@ -2,86 +2,124 @@
 
 namespace App\Controllers;
 
-use App\Models\SiswaModel;
+use App\Models\KelasModel;
 use App\Models\PresensiModel;
+use App\Models\SiswaModel;
+use App\Models\TahunAjaranModel;
+use CodeIgniter\HTTP\RedirectResponse;
 
 class Presensi extends BaseController
 {
-    protected $siswaModel;
-    protected $presensiModel;
+    protected PresensiModel $presensiModel;
+    protected SiswaModel $siswaModel;
+    protected KelasModel $kelasModel;
 
     public function __construct()
     {
-        $this->siswaModel = new SiswaModel();
         $this->presensiModel = new PresensiModel();
+        $this->siswaModel    = new SiswaModel();
+        $this->kelasModel    = new KelasModel();
     }
 
-    public function index()
+    public function index(): string
     {
-        $kelas = $this->request->getGet('kelas');
+        $kelasList = $this->kelasModel->orderBy('nama_kelas', 'ASC')->findAll();
 
-        if ($kelas) {
-    $siswa = $this->siswaModel
-        ->select('siswa.*')
-        ->join('kelas', 'kelas.id_kelas = siswa.id_kelas')
-        ->where('kelas.nama_kelas', $kelas)
-        ->findAll();
-} else {
-    $siswa = $this->siswaModel->findAll();
-}
+        // Default: kelas pertama
+        $idKelas = (int) $this->request->getGet('kelas');
+        if ($idKelas === 0 && $kelasList !== []) {
+            $idKelas = (int) $kelasList[0]['id_kelas'];
+        }
 
-        $data = [
-            'title' => 'Presensi Siswa',
-            'siswa' => $siswa,
-            'kelas' => $kelas
-        ];
+        // Tanggal tidak boleh melewati hari ini
+        $hari    = date('Y-m-d');
+        $tanggal = tanggal_valid($this->request->getGet('tanggal'), $hari);
+        if ($tanggal > $hari) {
+            $tanggal = $hari;
+        }
 
-        return view('presensi', $data);
+        $siswa = $idKelas > 0
+            ? $this->presensiModel->getByKelasTanggal($idKelas, $tanggal)
+            : [];
+
+        return view('presensi/index', [
+            'title'      => 'Presensi Siswa',
+            'kelasList'  => $kelasList,
+            'idKelas'    => $idKelas,
+            'tanggal'    => $tanggal,
+            'hari'       => $hari,
+            'siswa'      => $siswa,
+            'statusList' => PresensiModel::STATUS,
+        ]);
     }
 
-    public function simpan()
+    public function simpan(): RedirectResponse
     {
-        $tanggal = $this->request->getPost('tanggal');
-        $status = $this->request->getPost('status');
+        $idKelas = (int) $this->request->getPost('id_kelas');
+        $tanggal = tanggal_valid($this->request->getPost('tanggal'), '');
+
+        if ($tanggal === '' || $tanggal > date('Y-m-d')) {
+            return redirect()->to('presensi')->with('error', 'Tanggal presensi tidak valid.');
+        }
+
+        $kembali = 'presensi?kelas=' . $idKelas . '&tanggal=' . $tanggal;
+
+        $tahun = (new TahunAjaranModel())->getAktif();
+        if ($tahun === null) {
+            return redirect()->to($kembali)
+                ->with('error', 'Belum ada tahun ajaran aktif. Aktifkan satu tahun ajaran terlebih dahulu.');
+        }
+
+        $status     = $this->request->getPost('status');
         $keterangan = $this->request->getPost('keterangan');
 
-        if (!$tanggal || !$status) {
-            return redirect()
-                ->back()
-                ->with('error', 'Data presensi belum lengkap.');
+        if (! is_array($status) || $status === []) {
+            return redirect()->to($kembali)->with('error', 'Data presensi belum lengkap.');
         }
 
-        foreach ($status as $siswaId => $statusSiswa) {
+        // Hanya siswa yang benar-benar milik kelas ini yang boleh disimpan
+        $idSiswaValid = array_map(
+            'intval',
+            array_column(
+                $this->siswaModel->select('id_siswa')->where('id_kelas', $idKelas)->findAll(),
+                'id_siswa'
+            )
+        );
 
-            $data = [
-                'siswa_id' => $siswaId,
-                'tanggal' => $tanggal,
+        $idGuru = (int) session()->get('id_guru');
+        $rows   = [];
 
-                'status' => $statusSiswa,
-                'keterangan' => $keterangan[$siswaId] ?? null,
-                'waktu' => $statusSiswa === 'Hadir'
-                    ? date('H:i:s')
-                    : null
-            ];
+        foreach ($status as $idSiswa => $nilai) {
+            $idSiswa = (int) $idSiswa;
 
-            // Cek apakah siswa sudah presensi pada tanggal tersebut
-            $cek = $this->presensiModel
-                ->where('siswa_id', $siswaId)
-                ->where('tanggal', $tanggal)
-                ->first();
-
-            if ($cek) {
-                // Update
-                $this->presensiModel
-                    ->update($cek['id'], $data);
-            } else {
-                // Insert
-                $this->presensiModel->insert($data);
+            if (! in_array($idSiswa, $idSiswaValid, true)
+                || ! in_array($nilai, PresensiModel::STATUS, true)) {
+                continue;
             }
+
+            $ket = (is_array($keterangan) && isset($keterangan[$idSiswa]) && is_string($keterangan[$idSiswa]))
+                ? trim($keterangan[$idSiswa])
+                : '';
+
+            $rows[] = [
+                'id_siswa'   => $idSiswa,
+                'id_guru'    => $idGuru,
+                'id_tahun'   => (int) $tahun['id_tahun'],
+                'tanggal'    => $tanggal,
+                'status'     => $nilai,
+                'keterangan' => $ket !== '' ? mb_substr($ket, 0, 255) : null,
+            ];
         }
 
-        return redirect()
-            ->to('/presensi')
-            ->with('success', 'Presensi berhasil disimpan.');
+        if ($rows === []) {
+            return redirect()->to($kembali)->with('error', 'Tidak ada data presensi yang valid untuk disimpan.');
+        }
+
+        if (! $this->presensiModel->simpanBatch($rows)) {
+            return redirect()->to($kembali)->with('error', 'Presensi gagal disimpan. Silakan coba lagi.');
+        }
+
+        return redirect()->to($kembali)
+            ->with('success', count($rows) . ' data presensi tanggal ' . tanggal_indo($tanggal) . ' berhasil disimpan.');
     }
 }
